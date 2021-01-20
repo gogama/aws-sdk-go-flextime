@@ -3,13 +3,15 @@
 // license that can be found in the LICENSE file.
 
 /*
-Package flextime allows timeouts to vary during retries of AWS SDK
+Package flextime provides adaptive timeouts when retrying AWS SDK
 requests.
 
-Out of the box, the AWS SDK for Go only supports a constant timeout
-value per request attempt (initial attempt and retry). Install a
-flextime timeout function on an AWS SDK session or client to vary
-timeouts across request attempts.
+Out of the box, the AWS SDK for Go only supports the static timeout
+values available on the Go standard HTTP client (http.Client from
+package net/http). These timeout values cannot be changed per request
+attempt (initial attempt and retry). Install a flextime timeout
+function on an AWS SDK session or client to vary timeouts across request
+attempts.
 
 To set an initial low timeout, and back off to successively higher
 timeout values, use a sequence:
