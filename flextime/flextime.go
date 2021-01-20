@@ -16,29 +16,50 @@ timeout values, use a sequence:
 
 	f := flextime.Sequence(350*time.Millisecond, 1*time.Second, 2*time.Second)
 	s := session.Must(session.NewSession())
-	flextime.OnSession(s, f)      // Install timeout sequence all clients with session
-	ddb := dynamodb.New(s)        // New DynamoDB client with session, will use f
-	loc := locationservice.New(s) // New Amazon Location Service client with session, will use f
+	err := flextime.OnSession(s, f)   // Install timeout sequence all clients with session
+	if err != nil {
+		// Handle error
+	}
+	ddb := dynamodb.New(s)            // New DynamoDB client with session, will use f
+	loc := locationservice.New(s)     // New Amazon Location Service client with session, will use f
 
 To add install a timeout function on a specific client instance:
 
 	c := sqs.New(s)
-	flextime.OnClient(c.Client, f) // Install timeout function f on new SQS client
+	err := flextime.OnClient(c.Client, f) // Install timeout function f on new SQS client
+	if err != nil {
+		// Handle error
+	}
 
 To roll your own timeout function:
 
 	func myTimeoutFunc(r *request.Request, int n) time.Duration {
 		return ...
 	}
-	flextime.OnSession(s, myTimeoutFunc)         // Install for all clients with session...
-	flextime.OnClient(ddb.Client, myTimeoutFunc) // ...or install for specific client only
+
+	func main() {
+		var err error
+		err = flextime.OnSession(s, myTimeoutFunc)         // Install for all clients with session...
+		if err != nil {
+			// Handle error
+		}
+		err = flextime.OnClient(ddb.Client, myTimeoutFunc) // ...or install for specific client only
+		if err != nil {
+			// Handle error
+		}
+	}
 */
 package flextime
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
+
+	"github.com/aws/aws-sdk-go/aws/awserr"
+
+	"github.com/aws/aws-sdk-go/aws/corehandlers"
 
 	"github.com/aws/aws-sdk-go/aws"
 
@@ -46,8 +67,6 @@ import (
 	"github.com/aws/aws-sdk-go/aws/request"
 	"github.com/aws/aws-sdk-go/aws/session"
 )
-
-const nilTimeoutFuncMsg = "flextime: nil timeout func"
 
 // A TimeoutFunc computes a timeout for an AWS SDK request attempt based
 // on the request state and the number n of timeouts that have occurred
@@ -60,29 +79,21 @@ type TimeoutFunc func(r *request.Request, n int) time.Duration
 // OnSession sets the TimeoutFunc used to compute timeouts for all
 // clients created using the given AWS SDK session. The previous
 // TimeoutFunc on the session, if any, is replaced.
-func OnSession(s *session.Session, f TimeoutFunc) {
+func OnSession(s *session.Session, f TimeoutFunc) error {
 	if s == nil {
 		panic("flextime: nil session")
 	}
-	if f == nil {
-		panic(nilTimeoutFuncMsg)
-	}
-	s.Handlers.Send.SetFrontNamed(beforeSend(f))
-	s.Handlers.Send.SetBackNamed(afterSend)
+	return onHandlerList(s.Handlers.Send, f)
 }
 
 // OnClient sets the TimeoutFunc used to compute timeouts for the given
 // AWS SDK client. The previous TimeoutFunc on the session, if any, is
 // replaced.
-func OnClient(c *client.Client, f TimeoutFunc) {
+func OnClient(c *client.Client, f TimeoutFunc) error {
 	if c == nil {
 		panic("flextime: nil client")
 	}
-	if f == nil {
-		panic(nilTimeoutFuncMsg)
-	}
-	c.Handlers.Send.SetFrontNamed(beforeSend(f))
-	c.Handlers.Send.SetBackNamed(afterSend)
+	return onHandlerList(c.Handlers.Send, f)
 }
 
 // Sequence constructs a timeout function that varies the next timeout
@@ -132,64 +143,60 @@ type configKeyType string
 const configKey configKeyType = "flextime.ConfigKey"
 
 type config struct {
-	cancel context.CancelFunc // Cancel function for context that contains timeout
-	n      int                // Number of consecutive timeouts
+	n int // Number of consecutive timeouts
 }
 
-func beforeSend(f TimeoutFunc) request.NamedHandler {
-	if f == nil {
+const (
+	handlerName       = "flextime.SendHandler"
+	nilTimeoutFuncMsg = "flextime: nil timeout func"
+	nilWrappedFuncMsg = "flextime: nil wrapped func"
+	failedInstallMsg  = "flextime: failed swap send handler"
+)
+
+var coreSendHandler = corehandlers.SendHandler
+
+func onHandlerList(hl request.HandlerList, f TimeoutFunc) error {
+	h := request.NamedHandler{
+		Name: handlerName,
+		Fn:   wrapWithTimeout(f, coreSendHandler.Fn),
+	}
+	if !hl.Swap(coreSendHandler.Name, h) && !hl.Swap(handlerName, h) {
+		return errors.New(failedInstallMsg)
+	}
+	return nil
+}
+
+func wrapWithTimeout(tf TimeoutFunc, wf func(*request.Request)) func(*request.Request) {
+	if tf == nil {
 		panic(nilTimeoutFuncMsg)
 	}
-	return request.NamedHandler{
-		Name: "flextime.BeforeSend",
-		Fn: func(r *request.Request) {
-			ctx := r.Context()
-			val := ctx.Value(configKey)
-			cfg, ok := val.(*config)
-			if !ok {
-				cfg = &config{}
-				ctx = context.WithValue(ctx, configKey, cfg)
-				r.SetContext(ctx)
-			}
-			timeout := f(r, cfg.n)
-			logDebug(r, "timeout %v", timeoutFmt(timeout))
-			if timeout > 0 {
-				// THIS IS FAILING. BECAUSE AWS SDK SHIFTS THE CONTEXT OVER FROM
-				// THE PREVIOUS HTTP REQUEST using `copyHTTPRequest()`.
-				// IDEA: Replace `core.SendHandler` with a wrapper that sets the
-				// deadline AND THEN PASSES THROUGH TO `core.SendHandler`.
-				httpCtx, cancel := context.WithTimeout(r.HTTPRequest.Context(), timeout)
-				cfg.cancel = cancel
-				r.HTTPRequest = r.HTTPRequest.WithContext(httpCtx)
-			}
-		},
+	if wf == nil {
+		panic(nilWrappedFuncMsg)
 	}
-}
-
-var afterSend = request.NamedHandler{
-	Name: "flextime.AfterSend",
-	Fn: func(r *request.Request) {
+	return func(r *request.Request) {
 		ctx := r.Context()
 		val := ctx.Value(configKey)
-		if val == nil {
-			panic("flextime: missing config")
-		}
 		cfg, ok := val.(*config)
 		if !ok {
-			panic("flextime: wrong config type")
+			cfg = &config{}
+			ctx = context.WithValue(ctx, configKey, cfg)
+			r.SetContext(ctx)
 		}
-		if cfg.cancel == nil {
-			panic("flextime: nil cancel func")
+		timeout := tf(r, cfg.n)
+		logDebug(r, "timeout %v", timeoutFmt(timeout))
+		if timeout > 0 {
+			prevReq := r.HTTPRequest
+			httpCtx, cancel := context.WithTimeout(prevReq.Context(), timeout)
+			defer cancel()
+			tempReq := prevReq.WithContext(httpCtx)
+			defer func() { r.HTTPRequest = prevReq }()
+			r.HTTPRequest = tempReq
 		}
-		cfg.cancel()
-		cfg.cancel = nil
-		ot, ok := r.Error.(interface {
-			Timeout() bool
-		})
-		if ok && ot.Timeout() {
+		wf(r)
+		if isTimeout(r.Error) {
 			cfg.n++
 		}
-	},
+	}
 }
 
 func timeoutFmt(timeout time.Duration) interface{} {
@@ -206,4 +213,15 @@ func logDebug(r *request.Request, format string, a ...interface{}) {
 		msg := fmt.Sprintf(format, a...)
 		r.Config.Logger.Log(msg)
 	}
+}
+
+func isTimeout(err error) bool {
+	var awsErr awserr.Error
+	if errors.As(err, &awsErr) {
+		err = awsErr.OrigErr()
+	}
+	ot, ok := err.(interface {
+		Timeout() bool
+	})
+	return ok && ot.Timeout()
 }
