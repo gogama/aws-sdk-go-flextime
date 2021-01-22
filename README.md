@@ -146,3 +146,8 @@ An AWS SDK client with flextime installed will continue to respect the context
 deadline as normal. This means you can have an adaptive timeout policy applying
 at the individual HTTP request level *and* a macro timeout applying to the
 entire "logical" request.
+
+## What other projects support adaptive timeouts?
+
+Package [httpx](https://github.com/gogama/httpx) (general purpose reliable HTTP
+client for Go with retry) supports configurable timeout policies.
