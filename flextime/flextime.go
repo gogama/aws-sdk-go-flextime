@@ -202,7 +202,7 @@ func wrapWithTimeout(tf TimeoutFunc, wf func(*request.Request)) func(*request.Re
 			tempReq := prevHTTPReq.WithContext(httpCtx)
 			defer func() { r.HTTPRequest = prevHTTPReq }()
 			r.HTTPRequest = tempReq
-		} else {
+		} else if !ok {
 			// Put back old HTTP request context.
 			r.HTTPRequest = r.HTTPRequest.WithContext(prevHTTPCtx)
 		}
