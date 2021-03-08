@@ -176,23 +176,35 @@ func wrapWithTimeout(tf TimeoutFunc, wf func(*request.Request)) func(*request.Re
 		panic(nilWrappedFuncMsg)
 	}
 	return func(r *request.Request) {
-		ctx := r.Context()
-		val := ctx.Value(configKey)
+		awsCtx := r.Context()
+		prevHTTPReq := r.HTTPRequest
+		prevHTTPCtx := prevHTTPReq.Context()
+		val := awsCtx.Value(configKey)
 		cfg, ok := val.(*config)
 		if !ok {
 			cfg = &config{}
-			ctx = context.WithValue(ctx, configKey, cfg)
-			r.SetContext(ctx)
+			awsCtx = context.WithValue(awsCtx, configKey, cfg)
+			// Update the context on the AWS request. This will also replace the
+			// context on the HTTP request, which can break some integrations,
+			// such as X-Ray, which only add values into the HTTP request
+			// context. To fix this, we will work with/put back the HTTP context
+			// below.
+			r.SetContext(awsCtx)
 		}
 		timeout := tf(r, cfg.n)
 		logDebug(r, "timeout %v", timeoutFmt(timeout))
 		if timeout > 0 {
-			prevReq := r.HTTPRequest
-			httpCtx, cancel := context.WithTimeout(prevReq.Context(), timeout)
+			// Create HTTP request context, with timeout, based on previous HTTP
+			// request context, so we don't overwrite values put into the HTTP
+			// context by other integrations such as X-Ray.
+			httpCtx, cancel := context.WithTimeout(prevHTTPCtx, timeout)
 			defer cancel()
-			tempReq := prevReq.WithContext(httpCtx)
-			defer func() { r.HTTPRequest = prevReq }()
+			tempReq := prevHTTPReq.WithContext(httpCtx)
+			defer func() { r.HTTPRequest = prevHTTPReq }()
 			r.HTTPRequest = tempReq
+		} else {
+			// Put back old HTTP request context.
+			r.HTTPRequest = r.HTTPRequest.WithContext(prevHTTPCtx)
 		}
 		wf(r)
 		if isTimeout(r.Error) {
