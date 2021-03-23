@@ -388,7 +388,7 @@ func TestIntegration_Header(t *testing.T) {
 					h := &simpleHandler{
 						headerDelay: innerTestCase.delay,
 					}
-					r := &simpleRetryer{}
+					r := &simpleRetryer{m: 3}
 					server, client := startServer(s, h, r)
 					defer server.Close()
 					outerTestCase.clientHook(t, f, client)
@@ -401,7 +401,7 @@ func TestIntegration_Header(t *testing.T) {
 					} else {
 						assert.False(t, isTimeout(err))
 					}
-					assert.Equal(t, numRetries, r.n)
+					assert.Equal(t, 3, r.n)
 					assert.GreaterOrEqual(t, duration, innerTestCase.minDuration)
 					assert.LessOrEqual(t, duration, innerTestCase.maxDuration)
 				})
@@ -414,6 +414,10 @@ func TestIntegration_Body(t *testing.T) {
 	// This test group focuses on integration testing, against a live server,
 	// timeout issues caused by the body not being served before the timeout
 	// expires.
+	//
+	// Note that because the flextime event handler has no way to "hook"
+	// timeouts occurring during the body read, there is no point setting any
+	// adaptive timeouts since they will never be used.
 	testCases := []struct {
 		name          string
 		bodyDelay     []time.Duration
@@ -423,16 +427,23 @@ func TestIntegration_Body(t *testing.T) {
 		maxDuration   time.Duration // Arbitrary upper bound for sanity
 	}{
 		{
-			name:        "no timeouts",
-			bodyDelay:   []time.Duration{5 * time.Millisecond, 10 * time.Millisecond, 15 * time.Millisecond},
-			serviceTime: []time.Duration{50 * time.Millisecond, 50 * time.Millisecond, 50 * time.Millisecond},
-			minDuration: 180 * time.Millisecond,
-			maxDuration: 750 * time.Millisecond,
+			name:        "no timeout",
+			serviceTime: []time.Duration{10 * time.Microsecond, 5 * time.Microsecond},
+			minDuration: 15 * time.Microsecond,
+			maxDuration: 500 * time.Millisecond,
+		},
+		{
+			name:          "timeout",
+			bodyDelay:     []time.Duration{100 * time.Millisecond, 100 * time.Millisecond, 400 * time.Millisecond, 400 * time.Millisecond, 400 * time.Millisecond},
+			serviceTime:   []time.Duration{100 * time.Millisecond, 200 * time.Millisecond, 1 * time.Second, 1 * time.Second, 1 * time.Second},
+			expectTimeout: true,
+			minDuration:   300 * time.Millisecond,
+			maxDuration:   750 * time.Second,
 		},
 	}
 
 	for _, outerTestCase := range integrationTestCases {
-		f := Sequence(75*time.Millisecond, 125*time.Millisecond)
+		f := Sequence(100 * time.Millisecond)
 		t.Run(outerTestCase.name, func(t *testing.T) {
 			s := outerTestCase.sessionFactory(t, f)
 			for _, innerTestCase := range testCases {
@@ -441,7 +452,7 @@ func TestIntegration_Body(t *testing.T) {
 						bodyDelay:       innerTestCase.bodyDelay,
 						bodyServiceTime: innerTestCase.serviceTime,
 					}
-					r := &simpleRetryer{}
+					r := &simpleRetryer{m: 5}
 					server, client := startServer(s, h, r)
 					defer server.Close()
 					outerTestCase.clientHook(t, f, client)
@@ -454,10 +465,8 @@ func TestIntegration_Body(t *testing.T) {
 					} else {
 						assert.False(t, isTimeout(err))
 					}
-					assert.Equal(t, numRetries, r.n)
-					assert.EqualError(t, err, "SerializationError: failed to unmarshal response error\n\tstatus code: 500, request id: \ncaused by: UnmarshalError: failed decoding error message\ncaused by: context canceled")
-					// TEMPORARY: UNCOMMENT LINE BELOW.
-					// assert.GreaterOrEqual(t, duration, innerTestCase.minDuration)
+					assert.Equal(t, r.m, r.n)
+					assert.GreaterOrEqual(t, duration, innerTestCase.minDuration)
 					assert.LessOrEqual(t, duration, innerTestCase.maxDuration)
 				})
 			}
@@ -508,13 +517,11 @@ var testOp = &request.Operation{
 }
 
 type simpleRetryer struct {
-	n int
+	m, n int
 }
 
-const numRetries = 2
-
 func (r *simpleRetryer) MaxRetries() int {
-	return numRetries
+	return r.m
 }
 
 func (r *simpleRetryer) RetryRules(_ *request.Request) time.Duration {
@@ -577,11 +584,14 @@ func (h *simpleHandler) ServeHTTP(w http.ResponseWriter, _ *http.Request) {
 	}
 	for i := 0; i < len(body)-1; i++ {
 		time.Sleep(bytePause)
-		w.Write(body[i : i+1])
+		_, err := w.Write(body[i : i+1])
+		if err != nil {
+			return
+		}
 		f.Flush()
 	}
-	time.Sleep(time.Now().Sub(bodyStart) - bodyServiceDuration)
-	w.Write(body[len(body)-1:])
+	time.Sleep(bodyServiceDuration - time.Now().Sub(bodyStart))
+	_, _ = w.Write(body[len(body)-1:])
 }
 
 var integrationTestCases = []struct {

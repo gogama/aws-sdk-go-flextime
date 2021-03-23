@@ -197,8 +197,7 @@ func wrapWithTimeout(tf TimeoutFunc, wf func(*request.Request)) func(*request.Re
 			// Create HTTP request context, with timeout, based on previous HTTP
 			// request context, so we don't overwrite values put into the HTTP
 			// context by other integrations such as X-Ray.
-			httpCtx, cancel := context.WithTimeout(prevHTTPCtx, timeout)
-			defer cancel()
+			httpCtx, _ := context.WithTimeout(prevHTTPCtx, timeout)
 			tempReq := prevHTTPReq.WithContext(httpCtx)
 			defer func() { r.HTTPRequest = prevHTTPReq }()
 			r.HTTPRequest = tempReq
