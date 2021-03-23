@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strconv"
 	"strings"
 	"syscall"
 	"testing"
@@ -347,7 +348,10 @@ func TestIsTimeout(t *testing.T) {
 	assert.False(t, isTimeout(awserr.New("ham", "eggs", &url.Error{Err: errors.New("qux")})))
 }
 
-func TestIntegration(t *testing.T) {
+func TestIntegration_Header(t *testing.T) {
+	// This test group focuses on integration testing, against a live server,
+	// timeout issues caused by the header not being served before the timeout
+	// expires.
 	testCases := []struct {
 		name          string
 		delay         []time.Duration
@@ -375,60 +379,90 @@ func TestIntegration(t *testing.T) {
 		},
 	}
 
-	t.Run("OnSession", func(t *testing.T) {
-		s := session.Must(session.NewSession())
-		err := OnSession(s, Sequence(50*time.Millisecond, 200*time.Millisecond))
-		require.NoError(t, err)
-		for _, testCase := range testCases {
-			t.Run(testCase.name, func(t *testing.T) {
-				h := &simpleHandler{
-					delay: testCase.delay,
-				}
-				r := &simpleRetryer{}
-				server, client := startServer(s, h, r)
-				defer server.Close()
-				start := time.Now()
-				_, err := client.GetItem(getItemInput)
-				duration := time.Now().Sub(start)
-				assert.Error(t, err)
-				if testCase.expectTimeout {
-					assert.True(t, isTimeout(err))
-				} else {
-					assert.False(t, isTimeout(err))
-				}
-				assert.Equal(t, numRetries, r.n)
-				assert.GreaterOrEqual(t, duration, testCase.minDuration)
-				assert.LessOrEqual(t, duration, testCase.maxDuration)
-			})
-		}
-	})
-	t.Run("OnClient", func(t *testing.T) {
-		s := session.Must(session.NewSession())
-		for _, testCase := range testCases {
-			t.Run(testCase.name, func(t *testing.T) {
-				h := &simpleHandler{
-					delay: testCase.delay,
-				}
-				r := &simpleRetryer{}
-				server, client := startServer(s, h, r)
-				defer server.Close()
-				err := OnClient(client.Client, Sequence(50*time.Millisecond, 100*time.Millisecond, 300*time.Millisecond))
-				require.NoError(t, err)
-				start := time.Now()
-				_, err = client.GetItem(getItemInput)
-				duration := time.Now().Sub(start)
-				assert.Error(t, err)
-				if testCase.expectTimeout {
-					assert.True(t, isTimeout(err))
-				} else {
-					assert.False(t, isTimeout(err))
-				}
-				assert.Equal(t, numRetries, r.n)
-				assert.GreaterOrEqual(t, duration, testCase.minDuration)
-				assert.LessOrEqual(t, duration, testCase.maxDuration)
-			})
-		}
-	})
+	for _, outerTestCase := range integrationTestCases {
+		f := Sequence(50*time.Millisecond, 100*time.Millisecond, 300*time.Millisecond)
+		t.Run(outerTestCase.name, func(t *testing.T) {
+			s := outerTestCase.sessionFactory(t, f)
+			for _, innerTestCase := range testCases {
+				t.Run(innerTestCase.name, func(t *testing.T) {
+					h := &simpleHandler{
+						headerDelay: innerTestCase.delay,
+					}
+					r := &simpleRetryer{}
+					server, client := startServer(s, h, r)
+					defer server.Close()
+					outerTestCase.clientHook(t, f, client)
+					start := time.Now()
+					_, err := client.GetItem(getItemInput)
+					duration := time.Now().Sub(start)
+					assert.Error(t, err)
+					if innerTestCase.expectTimeout {
+						assert.True(t, isTimeout(err))
+					} else {
+						assert.False(t, isTimeout(err))
+					}
+					assert.Equal(t, numRetries, r.n)
+					assert.GreaterOrEqual(t, duration, innerTestCase.minDuration)
+					assert.LessOrEqual(t, duration, innerTestCase.maxDuration)
+				})
+			}
+		})
+	}
+}
+
+func TestIntegration_Body(t *testing.T) {
+	// This test group focuses on integration testing, against a live server,
+	// timeout issues caused by the body not being served before the timeout
+	// expires.
+	testCases := []struct {
+		name          string
+		bodyDelay     []time.Duration
+		serviceTime   []time.Duration
+		expectTimeout bool
+		minDuration   time.Duration // Mathematical minimum possible time
+		maxDuration   time.Duration // Arbitrary upper bound for sanity
+	}{
+		{
+			name:        "no timeouts",
+			bodyDelay:   []time.Duration{5 * time.Millisecond, 10 * time.Millisecond, 15 * time.Millisecond},
+			serviceTime: []time.Duration{50 * time.Millisecond, 50 * time.Millisecond, 50 * time.Millisecond},
+			minDuration: 180 * time.Millisecond,
+			maxDuration: 750 * time.Millisecond,
+		},
+	}
+
+	for _, outerTestCase := range integrationTestCases {
+		f := Sequence(75*time.Millisecond, 125*time.Millisecond)
+		t.Run(outerTestCase.name, func(t *testing.T) {
+			s := outerTestCase.sessionFactory(t, f)
+			for _, innerTestCase := range testCases {
+				t.Run(innerTestCase.name, func(t *testing.T) {
+					h := &simpleHandler{
+						bodyDelay:       innerTestCase.bodyDelay,
+						bodyServiceTime: innerTestCase.serviceTime,
+					}
+					r := &simpleRetryer{}
+					server, client := startServer(s, h, r)
+					defer server.Close()
+					outerTestCase.clientHook(t, f, client)
+					start := time.Now()
+					_, err := client.GetItem(getItemInput)
+					duration := time.Now().Sub(start)
+					assert.Error(t, err)
+					if innerTestCase.expectTimeout {
+						assert.True(t, isTimeout(err))
+					} else {
+						assert.False(t, isTimeout(err))
+					}
+					assert.Equal(t, numRetries, r.n)
+					assert.EqualError(t, err, "SerializationError: failed to unmarshal response error\n\tstatus code: 500, request id: \ncaused by: UnmarshalError: failed decoding error message\ncaused by: context canceled")
+					// TEMPORARY: UNCOMMENT LINE BELOW.
+					// assert.GreaterOrEqual(t, duration, innerTestCase.minDuration)
+					assert.LessOrEqual(t, duration, innerTestCase.maxDuration)
+				})
+			}
+		})
+	}
 }
 
 // Constructor for a simple SDK-compatible request handler that is useful
@@ -493,18 +527,98 @@ func (r *simpleRetryer) ShouldRetry(_ *request.Request) bool {
 }
 
 type simpleHandler struct {
-	delay []time.Duration
-	i     int
+	headerDelay     []time.Duration
+	bodyDelay       []time.Duration
+	bodyServiceTime []time.Duration
+	i               int
 }
 
+// const body =
+
 func (h *simpleHandler) ServeHTTP(w http.ResponseWriter, _ *http.Request) {
-	i := h.i
-	h.i++
-	if i < len(h.delay) {
-		time.Sleep(h.delay[i])
+	defer func() { h.i++ }()
+
+	// Parley the response writer into a flusher. We use the flusher so we can
+	// flush work in progress down to the network stack as soon as it is ready,
+	// to ensure that the client sees a steady stream of data rather than a big
+	// bang at the end.
+	f, ok := w.(http.Flusher)
+	if !ok {
+		panic("w is not a Flusher")
 	}
+
+	// Define the static body bytes we will return.
+	body := []byte(`	{
+
+		"message": "Something went terribly wrong with the thing we were trying to do here."
+
+	}`)
+
+	// Pause for the delay time specified before writing the header.
+	h.pause(h.headerDelay)
+
+	// Write the header, along with a content-length field so the client knows
+	// how much data to expect.
+	w.Header().Set("Content-Length", strconv.Itoa(len(body)))
 	w.WriteHeader(500)
-	_, _ = w.Write([]byte(`{"message":"Something failed"}`))
+	f.Flush()
+
+	// Pause for the delay time specified before writing the body.
+	h.pause(h.bodyDelay)
+
+	// Write the body one byte at a time, pausing and flushing between each byte
+	// and overall ensuring that the time taken to write the entire body takes
+	// at least the specified service duration.
+	var bodyServiceDuration, bytePause time.Duration
+	bodyStart := time.Now()
+	if h.i < len(h.bodyServiceTime) {
+		bodyServiceDuration = h.bodyServiceTime[h.i]
+		bytePause = bodyServiceDuration / time.Duration(len(body))
+	}
+	for i := 0; i < len(body)-1; i++ {
+		time.Sleep(bytePause)
+		w.Write(body[i : i+1])
+		f.Flush()
+	}
+	time.Sleep(time.Now().Sub(bodyStart) - bodyServiceDuration)
+	w.Write(body[len(body)-1:])
+}
+
+var integrationTestCases = []struct {
+	name           string
+	sessionFactory func(t *testing.T, f TimeoutFunc) *session.Session
+	clientHook     func(t *testing.T, f TimeoutFunc, c *dynamodb.DynamoDB)
+}{
+	{
+		name: "OnSession",
+		sessionFactory: func(t *testing.T, f TimeoutFunc) *session.Session {
+			s, err := session.NewSession()
+			require.NoError(t, err)
+			err = OnSession(s, f)
+			require.NoError(t, err)
+			return s
+		},
+		clientHook: func(_ *testing.T, _ TimeoutFunc, _ *dynamodb.DynamoDB) {},
+	},
+	{
+		name: "OnClient",
+		sessionFactory: func(t *testing.T, _ TimeoutFunc) *session.Session {
+			s, err := session.NewSession()
+			require.NoError(t, err)
+			return s
+		},
+		clientHook: func(t *testing.T, f TimeoutFunc, c *dynamodb.DynamoDB) {
+			err := OnClient(c.Client, f)
+			require.NoError(t, err)
+		},
+	},
+}
+
+func (h *simpleHandler) pause(delay []time.Duration) {
+	if h.i < len(delay) {
+		d := delay[h.i]
+		time.Sleep(d)
+	}
 }
 
 func startServer(s *session.Session, h http.Handler, r *simpleRetryer) (*httptest.Server, *dynamodb.DynamoDB) {
