@@ -346,6 +346,7 @@ func TestIsTimeout(t *testing.T) {
 	assert.True(t, isTimeout(awserr.New("ham", "eggs", &url.Error{Err: syscall.ETIMEDOUT})))
 	assert.False(t, isTimeout(awserr.New("ham", "eggs", errors.New("baz"))))
 	assert.False(t, isTimeout(awserr.New("ham", "eggs", &url.Error{Err: errors.New("qux")})))
+	assert.True(t, isTimeout(awserr.New("outer", "outer", awserr.New("inner", "inner", &url.Error{Err: syscall.ETIMEDOUT}))))
 }
 
 func TestIntegration_Header(t *testing.T) {

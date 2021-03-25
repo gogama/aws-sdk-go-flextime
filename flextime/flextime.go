@@ -230,11 +230,11 @@ func logDebug(r *request.Request, format string, a ...interface{}) {
 
 func isTimeout(err error) bool {
 	var awsErr awserr.Error
-	if errors.As(err, &awsErr) {
+	for errors.As(err, &awsErr) {
 		err = awsErr.OrigErr()
 	}
-	ot, ok := err.(interface {
+	var t interface {
 		Timeout() bool
-	})
-	return ok && ot.Timeout()
+	}
+	return errors.As(err, &t) && t.Timeout()
 }
