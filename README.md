@@ -151,3 +151,12 @@ entire "logical" request.
 
 Package [httpx](https://github.com/gogama/httpx) (general purpose reliable HTTP
 client for Go with retry) supports configurable timeout policies.
+
+---
+
+Acknowledgements
+================
+
+Developer happiness on this project was boosted by JetBrains' generous donation
+of an [open source license](https://www.jetbrains.com/opensource/) for their
+lovely GoLand IDE. ❤
