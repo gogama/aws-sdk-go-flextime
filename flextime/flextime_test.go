@@ -362,21 +362,21 @@ func TestIntegration_Header(t *testing.T) {
 	}{
 		{
 			name:        "no timeouts",
-			maxDuration: 100 * time.Millisecond,
+			maxDuration: 200 * time.Millisecond,
 		},
 		{
 			name:          "one timeout",
-			delay:         []time.Duration{0, 0, 100 * time.Millisecond},
+			delay:         []time.Duration{0, 0, 200 * time.Millisecond},
 			expectTimeout: true,
 			minDuration:   50 * time.Millisecond,
-			maxDuration:   200 * time.Millisecond,
+			maxDuration:   500 * time.Millisecond,
 		},
 		{
 			name:          "multiple timeouts",
 			delay:         []time.Duration{100 * time.Millisecond, 500 * time.Millisecond, 500 * time.Millisecond},
 			expectTimeout: true,
 			minDuration:   450 * time.Millisecond,
-			maxDuration:   800 * time.Millisecond,
+			maxDuration:   1000 * time.Millisecond,
 		},
 	}
 
