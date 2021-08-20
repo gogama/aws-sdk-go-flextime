@@ -1,7 +1,7 @@
 flextime - Adaptive timeouts for AWS SDK for Go
 ===============================================
 
-[![Build Status](https://travis-ci.com/gogama/aws-sdk-go-flextime.svg)](https://travis-ci.com/gogama/aws-sdk-go-flextime) [![Go Report Card](https://goreportcard.com/badge/github.com/gogama/aws-sdk-go-flextime)](https://goreportcard.com/report/github.com/gogama/aws-sdk-go-flextime) [![PkgGoDev](https://pkg.go.dev/badge/github.com/gogama/aws-sdk-go-flextime)](https://pkg.go.dev/github.com/gogama/aws-sdk-go-flextime)
+[![Build Status](https://travis-ci.org/gogama/aws-sdk-go-flextime.svg)](https://travis-ci.com/gogama/aws-sdk-go-flextime) [![Go Report Card](https://goreportcard.com/badge/github.com/gogama/aws-sdk-go-flextime)](https://goreportcard.com/report/github.com/gogama/aws-sdk-go-flextime) [![PkgGoDev](https://pkg.go.dev/badge/github.com/gogama/aws-sdk-go-flextime)](https://pkg.go.dev/github.com/gogama/aws-sdk-go-flextime)
 
 Package flextime provides adaptive timeouts when retrying requests to AWS
 services using the [AWS SDK for Go](https://github.com/aws/aws-sdk-go).
