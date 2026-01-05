@@ -68,6 +68,64 @@ func main() {
 }
 ```
 
+For AWS SDK for Go v2, use the flextime/v2 package:
+
+```go
+package main
+
+import (
+	"context"
+	"time"
+
+	"github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
+	"github.com/gogama/aws-sdk-go-flextime/flextime/v2"
+)
+
+func main() {
+	cfg, err := config.LoadDefaultConfig(context.TODO())
+	if err != nil {
+		// Handle error
+	}
+	// Set timeouts: 200ms initial, 800ms first retry, 2s subsequent retries
+	flextime.OnConfig(&cfg, flextime.Sequence(200*time.Millisecond, 800*time.Millisecond, 2*time.Second))
+	ddb := dynamodb.NewFromConfig(cfg)
+	// Use ddb client with adaptive timeouts
+}
+```
+
+You can also use a custom timeout strategy with v2:
+
+```go
+package main
+
+import (
+	"context"
+	"time"
+
+	"github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/service/s3"
+	"github.com/aws/aws-sdk-go-v2/service/sqs"
+	"github.com/gogama/aws-sdk-go-flextime/flextime/v2"
+)
+
+func timeoutStrategy(attempt int) time.Duration {
+	// Your custom timeout strategy implementation.
+	return time.Duration(attempt+1) * 500 * time.Millisecond
+}
+
+func main() {
+	cfg, err := config.LoadDefaultConfig(context.TODO())
+	if err != nil {
+		// Handle error
+	}
+	flextime.OnConfig(&cfg, timeoutStrategy)
+	s3Client := s3.NewFromConfig(cfg)   // S3 client uses custom timeout strategy.
+	sqsClient := sqs.NewFromConfig(cfg) // SQS client uses same custom timeout strategy.
+	doStuff(s3Client, sqsClient)
+}
+```
+
 Check out [the full API documentation](https://pkg.go.dev/github.com/gogama/aws-sdk-go-flextime).
 
 ---
@@ -90,8 +148,7 @@ Package flextime works on Go 1.13 and higher.
 
 Package flextime works on AWS SDK 1.14.0 and higher.
 
-*The new [AWS SDK for Go v2](https://github.com/aws/aws-sdk-go-v2) is not
-supported.*
+The [AWS SDK for Go v2](https://github.com/aws/aws-sdk-go-v2) is supported by flextime/v2.
 
 ## Why do I want adaptive timeouts on the AWS SDK for Go?
 
