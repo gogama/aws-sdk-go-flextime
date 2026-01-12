@@ -68,7 +68,7 @@ func main() {
 }
 ```
 
-For AWS SDK for Go v2, use the flextime/v2 package:
+For AWS SDK for Go v2, use the v2 package:
 
 ```go
 package main
@@ -79,7 +79,7 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
-	"github.com/gogama/aws-sdk-go-flextime/flextime/v2"
+	"github.com/gogama/aws-sdk-go-flextime/v2"
 )
 
 func main() {
@@ -106,7 +106,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/sqs"
-	"github.com/gogama/aws-sdk-go-flextime/flextime/v2"
+	"github.com/gogama/aws-sdk-go-flextime/v2"
 )
 
 func timeoutStrategy(attempt int) time.Duration {
