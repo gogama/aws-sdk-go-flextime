@@ -105,7 +105,7 @@ func TestIntegration_Header(t *testing.T) {
 		},
 		{
 			name:          "one timeout",
-			delay:         []time.Duration{0, 0, 5 * time.Second},
+			delay:         []time.Duration{0, 0, 350 * time.Millisecond},
 			expectTimeout: true,
 			minDuration:   50 * time.Millisecond,
 			maxDuration:   500 * time.Millisecond,
