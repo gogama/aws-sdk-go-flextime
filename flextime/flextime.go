@@ -16,12 +16,11 @@ attempts.
 To set an initial low timeout, and back off to successively higher
 timeout values, use a sequence:
 
+	f := flextime.Sequence(350*time.Millisecond, 1*time.Second, 2*time.Second)
 	cfg, err := config.LoadDefaultConfig(context.TODO())
 	if err != nil {
 		// Handle error
 	}
-
-	f := flextime.Sequence(350*time.Millisecond, 1*time.Second, 2*time.Second)
 	flextime.OnConfig(&cfg, f)
 	client := dynamodb.NewFromConfig(cfg)
 
