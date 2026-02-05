@@ -1,4 +1,4 @@
-module github.com/gogama/aws-sdk-go-flextime/v2
+module github.com/gogama/aws-sdk-go-flextime/flextime/v2
 
 go 1.25.5
 
