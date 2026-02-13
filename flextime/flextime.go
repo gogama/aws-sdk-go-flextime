@@ -63,6 +63,13 @@ func OnConfig(cfg *aws.Config, f TimeoutFunc) {
 
 	// Add our middleware to the config's APIOptions
 	middlewareFunc := func(stack *middleware.Stack) error {
+		// Reset counter at the start of each API call
+		err := stack.Initialize.Add(&resetMiddleware{
+			counter: &attemptCounter,
+		}, middleware.Before)
+		if err != nil {
+			return err
+		}
 		return stack.Deserialize.Add(&timeoutMiddleware{
 			timeoutFunc: f,
 			counter:     &attemptCounter,
@@ -70,6 +77,21 @@ func OnConfig(cfg *aws.Config, f TimeoutFunc) {
 	}
 
 	cfg.APIOptions = append(cfg.APIOptions, middlewareFunc)
+}
+
+type resetMiddleware struct {
+	counter *int
+}
+
+func (m *resetMiddleware) ID() string {
+	return resetMiddlewareName
+}
+
+func (m *resetMiddleware) HandleInitialize(
+	ctx context.Context, in middleware.InitializeInput, next middleware.InitializeHandler,
+) (middleware.InitializeOutput, middleware.Metadata, error) {
+	*m.counter = 0
+	return next.HandleInitialize(ctx, in)
 }
 
 type timeoutMiddleware struct {
@@ -88,12 +110,26 @@ func (m *timeoutMiddleware) ID() string {
 }
 
 const (
-	handlerName       = "flextime.SendHandler"
-	middlewareName    = "flextime.DeserializeMiddleware"
-	nilTimeoutFuncMsg = "flextime: nil timeout func"
-	nilWrappedFuncMsg = "flextime: nil wrapped func"
-	failedInstallMsg  = "flextime: failed swap send handler"
+	handlerName         = "flextime.SendHandler"
+	middlewareName      = "flextime.DeserializeMiddleware"
+	resetMiddlewareName = "flextime.ResetMiddleware"
+	nilTimeoutFuncMsg   = "flextime: nil timeout func"
+	nilWrappedFuncMsg   = "flextime: nil wrapped func"
+	failedInstallMsg    = "flextime: failed swap send handler"
 )
+
+// FlextimeTimeoutError wraps an error caused by a per-attempt flextime
+// timeout. It implements Timeout() bool so the SDK's standard retry
+// handler (retry.IsErrorTimeout) recognises it as retryable without
+// needing a custom retryer.
+type FlextimeTimeoutError struct {
+	Err error
+}
+
+func (e *FlextimeTimeoutError) Error() string       { return e.Err.Error() }
+func (e *FlextimeTimeoutError) Unwrap() error       { return e.Err }
+func (e *FlextimeTimeoutError) Timeout() bool       { return true }
+func (e *FlextimeTimeoutError) CanceledError() bool { return false }
 
 func (m *timeoutMiddleware) HandleDeserialize(
 	ctx context.Context, in middleware.DeserializeInput, next middleware.DeserializeHandler,
@@ -101,6 +137,10 @@ func (m *timeoutMiddleware) HandleDeserialize(
 	// Get current attempt number
 	attempt := *m.counter
 	*m.counter++
+
+	// Keep a reference to the parent (caller's) context so we can
+	// distinguish a per-attempt timeout from a caller cancellation.
+	parentCtx := ctx
 
 	// Calculate timeout
 	timeout := m.timeoutFunc(attempt)
@@ -112,6 +152,13 @@ func (m *timeoutMiddleware) HandleDeserialize(
 	}
 
 	output, metadata, err := next.HandleDeserialize(ctx, in)
+
+	// If the child (per-attempt) context timed out but the parent
+	// context is still alive, wrap the error so the SDK treats it as
+	// a retryable timeout rather than a caller cancellation.
+	if err != nil && ctx.Err() != nil && parentCtx.Err() == nil {
+		err = &FlextimeTimeoutError{Err: err}
+	}
 
 	return output, metadata, err
 }
