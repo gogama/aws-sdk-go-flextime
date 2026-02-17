@@ -51,6 +51,9 @@ import (
 // request attempt. A zero return value means no timeout.
 type TimeoutFunc func(attempt int) time.Duration
 
+// attemptKey is the context key for the per-request attempt counter.
+type attemptKey struct{}
+
 // OnConfig configures the given AWS SDK v2 config to use the
 // provided TimeoutFunc for adaptive timeouts.
 func OnConfig(cfg *aws.Config, f TimeoutFunc) {
@@ -58,30 +61,22 @@ func OnConfig(cfg *aws.Config, f TimeoutFunc) {
 		panic("flextime: nil timeout func")
 	}
 
-	// Create a shared attempt counter
-	attemptCounter := 0
-
 	// Add our middleware to the config's APIOptions
 	middlewareFunc := func(stack *middleware.Stack) error {
-		// Reset counter at the start of each API call
-		err := stack.Initialize.Add(&resetMiddleware{
-			counter: &attemptCounter,
-		}, middleware.Before)
+		// Create a per-request counter at the start of each API call
+		err := stack.Initialize.Add(&resetMiddleware{}, middleware.Before)
 		if err != nil {
 			return err
 		}
 		return stack.Deserialize.Add(&timeoutMiddleware{
 			timeoutFunc: f,
-			counter:     &attemptCounter,
 		}, middleware.Before)
 	}
 
 	cfg.APIOptions = append(cfg.APIOptions, middlewareFunc)
 }
 
-type resetMiddleware struct {
-	counter *int
-}
+type resetMiddleware struct{}
 
 func (m *resetMiddleware) ID() string {
 	return resetMiddlewareName
@@ -90,13 +85,13 @@ func (m *resetMiddleware) ID() string {
 func (m *resetMiddleware) HandleInitialize(
 	ctx context.Context, in middleware.InitializeInput, next middleware.InitializeHandler,
 ) (middleware.InitializeOutput, middleware.Metadata, error) {
-	*m.counter = 0
+	counter := new(int)
+	ctx = context.WithValue(ctx, attemptKey{}, counter)
 	return next.HandleInitialize(ctx, in)
 }
 
 type timeoutMiddleware struct {
 	timeoutFunc TimeoutFunc
-	counter     *int
 }
 
 type timeoutInitialize struct{}
@@ -134,9 +129,10 @@ func (e *FlextimeTimeoutError) CanceledError() bool { return false }
 func (m *timeoutMiddleware) HandleDeserialize(
 	ctx context.Context, in middleware.DeserializeInput, next middleware.DeserializeHandler,
 ) (middleware.DeserializeOutput, middleware.Metadata, error) {
-	// Get current attempt number
-	attempt := *m.counter
-	*m.counter++
+	// Get the per-request attempt counter from the context.
+	counter := ctx.Value(attemptKey{}).(*int)
+	attempt := *counter
+	*counter++
 
 	// Keep a reference to the parent (caller's) context so we can
 	// distinguish a per-attempt timeout from a caller cancellation.

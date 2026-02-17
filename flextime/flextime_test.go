@@ -13,6 +13,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"strconv"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
@@ -481,6 +482,126 @@ func TestFlextimeRetryWithStandardRetryer(t *testing.T) {
 		assert.GreaterOrEqual(t, h.i, 2,
 			"expected at least 2 attempts: initial timeout + retry")
 	})
+}
+
+func TestConcurrentAPICalls(t *testing.T) {
+	t.Run("parallel calls get independent attempt counters", func(t *testing.T) {
+		// Each goroutine makes an API call with retries. If the counter
+		// is shared, the attempt numbers will be wrong. With per-request
+		// context counters, each call should see attempts 0, 1, 2 independently.
+		const goroutines = 10
+		const maxAttempts = 3
+
+		// Track attempts per goroutine via a server-side delay that forces retries.
+		f := Sequence(2 * time.Second)
+		c, _ := config.LoadDefaultConfig(context.TODO(),
+			config.WithRegion("us-east-1"),
+			config.WithCredentialsProvider(credentials.NewStaticCredentialsProvider("test", "test", "")),
+		)
+		OnConfig(&c, f)
+
+		// Use a handler that always returns 500 so every call retries maxAttempts times.
+		h := &concurrentHandler{}
+		sdkRetryer := retry.NewStandard(func(o *retry.StandardOptions) {
+			o.MaxAttempts = maxAttempts
+			o.Backoff = zeroBackoff{}
+			o.RateLimiter = ratelimit.None
+		})
+		r := func() aws.Retryer { return sdkRetryer }
+		server, client := startServer(h, c, r)
+		defer server.Close()
+
+		errs := make(chan error, goroutines)
+		for i := 0; i < goroutines; i++ {
+			go func() {
+				_, err := client.GetItem(context.TODO(), getItemInput)
+				errs <- err
+			}()
+		}
+
+		for i := 0; i < goroutines; i++ {
+			err := <-errs
+			assert.Error(t, err)
+		}
+
+		// Each goroutine should have made exactly maxAttempts requests.
+		totalRequests := h.count()
+		assert.Equal(t, goroutines*maxAttempts, totalRequests,
+			"expected %d total requests (%d goroutines × %d attempts)",
+			goroutines*maxAttempts, goroutines, maxAttempts)
+	})
+
+	t.Run("parallel calls each start at attempt 0", func(t *testing.T) {
+		// Verify that concurrent calls through the same client each
+		// independently start at attempt 0 by recording the attempt
+		// numbers seen by the TimeoutFunc.
+		const goroutines = 10
+
+		var mu sync.Mutex
+		var allFirstAttempts []int
+
+		f := func(attempt int) time.Duration {
+			mu.Lock()
+			allFirstAttempts = append(allFirstAttempts, attempt)
+			mu.Unlock()
+			return 2 * time.Second
+		}
+
+		c, _ := config.LoadDefaultConfig(context.TODO(),
+			config.WithRegion("us-east-1"),
+			config.WithCredentialsProvider(credentials.NewStaticCredentialsProvider("test", "test", "")),
+		)
+		OnConfig(&c, f)
+
+		h := &concurrentHandler{}
+		sdkRetryer := retry.NewStandard(func(o *retry.StandardOptions) {
+			o.MaxAttempts = 1
+			o.Backoff = zeroBackoff{}
+			o.RateLimiter = ratelimit.None
+		})
+		r := func() aws.Retryer { return sdkRetryer }
+		server, client := startServer(h, c, r)
+		defer server.Close()
+
+		var wg sync.WaitGroup
+		for i := 0; i < goroutines; i++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				_, _ = client.GetItem(context.TODO(), getItemInput)
+			}()
+		}
+		wg.Wait()
+
+		// With MaxAttempts=1, each goroutine makes exactly one attempt.
+		// Every recorded attempt number should be 0.
+		mu.Lock()
+		defer mu.Unlock()
+		assert.Equal(t, goroutines, len(allFirstAttempts))
+		for i, a := range allFirstAttempts {
+			assert.Equal(t, 0, a, "goroutine %d saw attempt %d, expected 0", i, a)
+		}
+	})
+}
+
+// concurrentHandler is a thread-safe HTTP handler that counts requests.
+type concurrentHandler struct {
+	mu sync.Mutex
+	n  int
+}
+
+func (h *concurrentHandler) ServeHTTP(w http.ResponseWriter, _ *http.Request) {
+	h.mu.Lock()
+	h.n++
+	h.mu.Unlock()
+	w.WriteHeader(500)
+	_, _ = w.Write([]byte(`{"message":"error"}`))
+}
+
+func (h *concurrentHandler) count() int {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.n
 }
 
 func TestFlextimeTimeoutError(t *testing.T) {
