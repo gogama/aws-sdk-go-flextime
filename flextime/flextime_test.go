@@ -9,16 +9,20 @@ import (
 	"crypto/tls"
 	"errors"
 	"fmt"
-	"github.com/aws/aws-sdk-go-v2/config"
-	"github.com/aws/aws-sdk-go-v2/credentials"
-	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"strconv"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
+
+	"github.com/aws/aws-sdk-go-v2/aws/ratelimit"
+	"github.com/aws/aws-sdk-go-v2/aws/retry"
+	"github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/credentials"
+	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
@@ -345,6 +349,40 @@ func startServer(h http.Handler, cfg aws.Config, r func() aws.Retryer) (*httptes
 	return server, client
 }
 
+func TestResetMiddleware(t *testing.T) {
+	t.Run("counter resets between API calls", func(t *testing.T) {
+		// Track the attempt numbers seen by the timeout func
+		var attempts []int
+		f := func(attempt int) time.Duration {
+			attempts = append(attempts, attempt)
+			return 0
+		}
+
+		c, _ := config.LoadDefaultConfig(context.TODO(),
+			config.WithRegion("us-east-1"),
+			config.WithCredentialsProvider(credentials.NewStaticCredentialsProvider("test", "test", "")),
+		)
+		OnConfig(&c, f)
+
+		h := &simpleHandler{}
+		retryer := &simpleRetryer{m: 1, n: 0}
+		r := func() aws.Retryer { return retryer }
+		server, client := startServer(h, c, r)
+		defer server.Close()
+
+		// First API call
+		_, _ = client.GetItem(context.TODO(), getItemInput)
+
+		// Second API call
+		_, _ = client.GetItem(context.TODO(), getItemInput)
+
+		// Both calls should have started at attempt 0
+		assert.GreaterOrEqual(t, len(attempts), 2)
+		assert.Equal(t, 0, attempts[0], "first call should start at attempt 0")
+		assert.Equal(t, 0, attempts[1], "second call should also start at attempt 0")
+	})
+}
+
 var getItemInput = &dynamodb.GetItemInput{
 	TableName: aws.String("foo"),
 	Key: map[string]types.AttributeValue{
@@ -352,4 +390,237 @@ var getItemInput = &dynamodb.GetItemInput{
 			Value: "baz",
 		},
 	},
+}
+
+// zeroBackoff returns zero delay so the SDK retry loop doesn't sleep
+// on the (possibly expired) child context between attempts.
+type zeroBackoff struct{}
+
+func (zeroBackoff) BackoffDelay(int, error) (time.Duration, error) { return 0, nil }
+
+func TestFlextimeRetryWithStandardRetryer(t *testing.T) {
+	t.Run("retries on server error", func(t *testing.T) {
+		// simpleHandler always returns 500. The SDK's standard retryer
+		// treats 500 as retryable, so it will retry up to MaxAttempts.
+		h := &simpleHandler{}
+
+		f := Sequence(2 * time.Second)
+		c, _ := config.LoadDefaultConfig(context.TODO(),
+			config.WithRegion("us-east-1"),
+			config.WithCredentialsProvider(credentials.NewStaticCredentialsProvider("test", "test", "")),
+		)
+		OnConfig(&c, f)
+
+		maxAttempts := 3
+		sdkRetryer := retry.NewStandard(func(o *retry.StandardOptions) {
+			o.MaxAttempts = maxAttempts
+			o.Backoff = zeroBackoff{}
+			o.RateLimiter = ratelimit.None
+		})
+		r := func() aws.Retryer { return sdkRetryer }
+		server, client := startServer(h, c, r)
+		defer server.Close()
+
+		_, err := client.GetItem(context.TODO(), getItemInput)
+		assert.Error(t, err)
+		assert.Equal(t, maxAttempts, h.i, "expected %d attempts", maxAttempts)
+	})
+
+	t.Run("no retry with single attempt", func(t *testing.T) {
+		h := &simpleHandler{}
+
+		f := Sequence(2 * time.Second)
+		c, _ := config.LoadDefaultConfig(context.TODO(),
+			config.WithRegion("us-east-1"),
+			config.WithCredentialsProvider(credentials.NewStaticCredentialsProvider("test", "test", "")),
+		)
+		OnConfig(&c, f)
+
+		sdkRetryer := retry.NewStandard(func(o *retry.StandardOptions) {
+			o.MaxAttempts = 1
+			o.Backoff = zeroBackoff{}
+			o.RateLimiter = ratelimit.None
+		})
+		r := func() aws.Retryer { return sdkRetryer }
+		server, client := startServer(h, c, r)
+		defer server.Close()
+
+		_, err := client.GetItem(context.TODO(), getItemInput)
+		assert.Error(t, err)
+		assert.Equal(t, 1, h.i, "expected only 1 attempt with MaxAttempts=1")
+	})
+
+	t.Run("retries on header timeout with adaptive backoff", func(t *testing.T) {
+		// First request has a header delay that exceeds the initial
+		// flextime timeout. FlextimeTimeoutError wrapping makes the
+		// SDK's retry.Standard treat it as retryable via Timeout() bool.
+		h := &simpleHandler{
+			headerDelay: []time.Duration{200 * time.Millisecond, 0, 0},
+		}
+
+		// 100ms initial timeout (will be exceeded), 2s on retry
+		f := Sequence(100*time.Millisecond, 2*time.Second)
+		c, _ := config.LoadDefaultConfig(context.TODO(),
+			config.WithRegion("us-east-1"),
+			config.WithCredentialsProvider(credentials.NewStaticCredentialsProvider("test", "test", "")),
+		)
+		OnConfig(&c, f)
+
+		sdkRetryer := retry.NewStandard(func(o *retry.StandardOptions) {
+			o.MaxAttempts = 3
+			o.Backoff = zeroBackoff{}
+			o.RateLimiter = ratelimit.None
+		})
+		r := func() aws.Retryer { return sdkRetryer }
+		server, client := startServer(h, c, r)
+		defer server.Close()
+
+		_, err := client.GetItem(context.TODO(), getItemInput)
+		assert.Error(t, err)
+		// First attempt times out (100ms < 200ms delay), then retries
+		// reach the server with the longer 2s timeout.
+		assert.GreaterOrEqual(t, h.i, 2,
+			"expected at least 2 attempts: initial timeout + retry")
+	})
+}
+
+func TestConcurrentAPICalls(t *testing.T) {
+	t.Run("parallel calls get independent attempt counters", func(t *testing.T) {
+		// Each goroutine makes an API call with retries. If the counter
+		// is shared, the attempt numbers will be wrong. With per-request
+		// context counters, each call should see attempts 0, 1, 2 independently.
+		const goroutines = 10
+		const maxAttempts = 3
+
+		// Track attempts per goroutine via a server-side delay that forces retries.
+		f := Sequence(2 * time.Second)
+		c, _ := config.LoadDefaultConfig(context.TODO(),
+			config.WithRegion("us-east-1"),
+			config.WithCredentialsProvider(credentials.NewStaticCredentialsProvider("test", "test", "")),
+		)
+		OnConfig(&c, f)
+
+		// Use a handler that always returns 500 so every call retries maxAttempts times.
+		h := &concurrentHandler{}
+		sdkRetryer := retry.NewStandard(func(o *retry.StandardOptions) {
+			o.MaxAttempts = maxAttempts
+			o.Backoff = zeroBackoff{}
+			o.RateLimiter = ratelimit.None
+		})
+		r := func() aws.Retryer { return sdkRetryer }
+		server, client := startServer(h, c, r)
+		defer server.Close()
+
+		errs := make(chan error, goroutines)
+		for i := 0; i < goroutines; i++ {
+			go func() {
+				_, err := client.GetItem(context.TODO(), getItemInput)
+				errs <- err
+			}()
+		}
+
+		for i := 0; i < goroutines; i++ {
+			err := <-errs
+			assert.Error(t, err)
+		}
+
+		// Each goroutine should have made exactly maxAttempts requests.
+		totalRequests := h.count()
+		assert.Equal(t, goroutines*maxAttempts, totalRequests,
+			"expected %d total requests (%d goroutines × %d attempts)",
+			goroutines*maxAttempts, goroutines, maxAttempts)
+	})
+
+	t.Run("parallel calls each start at attempt 0", func(t *testing.T) {
+		// Verify that concurrent calls through the same client each
+		// independently start at attempt 0 by recording the attempt
+		// numbers seen by the TimeoutFunc.
+		const goroutines = 10
+
+		var mu sync.Mutex
+		var allFirstAttempts []int
+
+		f := func(attempt int) time.Duration {
+			mu.Lock()
+			allFirstAttempts = append(allFirstAttempts, attempt)
+			mu.Unlock()
+			return 2 * time.Second
+		}
+
+		c, _ := config.LoadDefaultConfig(context.TODO(),
+			config.WithRegion("us-east-1"),
+			config.WithCredentialsProvider(credentials.NewStaticCredentialsProvider("test", "test", "")),
+		)
+		OnConfig(&c, f)
+
+		h := &concurrentHandler{}
+		sdkRetryer := retry.NewStandard(func(o *retry.StandardOptions) {
+			o.MaxAttempts = 1
+			o.Backoff = zeroBackoff{}
+			o.RateLimiter = ratelimit.None
+		})
+		r := func() aws.Retryer { return sdkRetryer }
+		server, client := startServer(h, c, r)
+		defer server.Close()
+
+		var wg sync.WaitGroup
+		for i := 0; i < goroutines; i++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				_, _ = client.GetItem(context.TODO(), getItemInput)
+			}()
+		}
+		wg.Wait()
+
+		// With MaxAttempts=1, each goroutine makes exactly one attempt.
+		// Every recorded attempt number should be 0.
+		mu.Lock()
+		defer mu.Unlock()
+		assert.Equal(t, goroutines, len(allFirstAttempts))
+		for i, a := range allFirstAttempts {
+			assert.Equal(t, 0, a, "goroutine %d saw attempt %d, expected 0", i, a)
+		}
+	})
+}
+
+// concurrentHandler is a thread-safe HTTP handler that counts requests.
+type concurrentHandler struct {
+	mu sync.Mutex
+	n  int
+}
+
+func (h *concurrentHandler) ServeHTTP(w http.ResponseWriter, _ *http.Request) {
+	h.mu.Lock()
+	h.n++
+	h.mu.Unlock()
+	w.WriteHeader(500)
+	_, _ = w.Write([]byte(`{"message":"error"}`))
+}
+
+func (h *concurrentHandler) count() int {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.n
+}
+
+func TestFlextimeTimeoutError(t *testing.T) {
+	t.Run("implements Timeout interface", func(t *testing.T) {
+		inner := errors.New("connection timed out")
+		fte := &FlextimeTimeoutError{Err: inner}
+		assert.True(t, fte.Timeout())
+		assert.Equal(t, inner.Error(), fte.Error())
+		assert.Equal(t, inner, errors.Unwrap(fte))
+	})
+
+	t.Run("isTimeout recognises it", func(t *testing.T) {
+		fte := &FlextimeTimeoutError{Err: errors.New("deadline exceeded")}
+		assert.True(t, isTimeout(fte))
+	})
+
+	t.Run("wrapped FlextimeTimeoutError is still detected", func(t *testing.T) {
+		fte := &FlextimeTimeoutError{Err: errors.New("deadline exceeded")}
+		wrapped := fmt.Errorf("operation failed: %w", fte)
+		assert.True(t, isTimeout(wrapped))
+	})
 }
